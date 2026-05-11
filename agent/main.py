@@ -29,7 +29,7 @@ from tools.search_documents import (
     save_index,
     search_documents,
 )
-from tools.update_memory import update_memory
+from tools.update_memory import read_memory, update_memory
 from tools.web_search import format_web_results_for_prompt, search_web
 
 
@@ -54,6 +54,17 @@ CONFUSION_PHRASES = (
     "still confused",
     "doesn't make sense",
     "does not make sense",
+)
+
+LEARNING_SIGNAL_PHRASES = (
+    "i am studying",
+    "i'm studying",
+    "i need to learn",
+    "i want to learn",
+    "i struggle with",
+    "i have trouble with",
+    "i find",
+    "hard for me",
 )
 
 WEB_SEARCH_REQUEST_PHRASES = (
@@ -141,10 +152,16 @@ def main() -> None:
         answer = answer_question(retrieval_question, chunks, web_results, web_reason)
         print(answer)
 
-        should_update, reason = should_update_memory(retrieval_question, previous_questions)
+        should_update, reason = should_update_memory(
+            retrieval_question,
+            previous_questions,
+            chunks,
+            web_results,
+            web_reason,
+        )
         print("Memory update:")
         if should_update:
-            update_memory(MEMORY_FILE, question, reason)
+            update_memory(MEMORY_FILE, retrieval_question, reason, answer)
             print(f"- Updated {MEMORY_FILE.relative_to(BASE_DIR)} ({reason}).")
         else:
             print("- No update needed.")
@@ -168,6 +185,7 @@ def answer_question(
 
     course_context = format_chunks_for_prompt(chunks)
     external_context = format_web_results_for_prompt(web_results or [])
+    memory_context = read_memory(MEMORY_FILE)
 
     if course_context and external_context:
         context = (
@@ -210,6 +228,7 @@ def answer_question(
         "and clearly say which parts are based on web search rather than the uploaded material.\n"
         "Do not ask permission to search the web; if web context is present, the search has already happened.\n"
         "If neither source has enough context, say so honestly.\n\n"
+        f"Student memory:\n{memory_context}\n\n"
         f"Retrieved context:\n{context}\n\n"
         f"Student question: {question}"
     )
@@ -288,7 +307,13 @@ def wants_web_search(question: str) -> bool:
     return any(phrase in normalized for phrase in WEB_SEARCH_REQUEST_PHRASES)
 
 
-def should_update_memory(question: str, previous_questions: list[str]) -> tuple[bool, str]:
+def should_update_memory(
+    question: str,
+    previous_questions: list[str],
+    chunks: list | None = None,
+    web_results: list | None = None,
+    web_reason: str | None = None,
+) -> tuple[bool, str]:
     """
     Decide whether the agent should call the memory tool.
 
@@ -302,6 +327,21 @@ def should_update_memory(question: str, previous_questions: list[str]) -> tuple[
 
     if normalized in (old_question.lower() for old_question in previous_questions):
         return True, "repeated question"
+
+    if any(phrase in normalized for phrase in LEARNING_SIGNAL_PHRASES):
+        return True, "student learning preference or struggle signal"
+
+    if web_results:
+        return True, "needed external web context"
+
+    if chunks:
+        min_score = float(os.getenv("LOCAL_CONTEXT_MIN_SCORE", DEFAULT_LOCAL_CONTEXT_MIN_SCORE))
+        best_score = max(chunk.score for chunk in chunks)
+        if best_score < min_score:
+            return True, "weak local retrieval"
+
+    if web_reason:
+        return True, f"web fallback did not retrieve context ({web_reason})"
 
     return False, ""
 
