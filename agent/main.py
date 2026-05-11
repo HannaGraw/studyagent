@@ -29,6 +29,7 @@ from pathlib import Path
 
 from tools.context_audit import build_context_audit, format_context_audit
 from tools.create_study_notes import create_study_note
+from tools.heartbeat_schedule import format_schedule, load_schedule, parse_schedule_request, save_schedule
 from tools.search_documents import (
     build_index,
     format_chunks_for_prompt,
@@ -44,6 +45,7 @@ BASE_DIR = Path(__file__).resolve().parent
 COURSE_DIR = BASE_DIR / "course_material"
 MEMORY_FILE = BASE_DIR / "memory" / "struggles.md"
 MASTERY_FILE = BASE_DIR / "memory" / "mastery.md"
+HEARTBEAT_SCHEDULE_FILE = BASE_DIR / "memory" / "heartbeat_schedule.json"
 NOTES_DIR = BASE_DIR / "generated_notes"
 AGENT_FILE = BASE_DIR / "agent.md"
 SOUL_FILE = BASE_DIR / "soul.md"
@@ -176,6 +178,12 @@ def main() -> None:
         if question.lower() in {"exit", "quit"}:
             break
         if not question:
+            continue
+
+        if wants_heartbeat_command(question):
+            print()
+            print(handle_heartbeat_command(question))
+            print()
             continue
 
         if pending_quiz and not wants_new_action(question):
@@ -733,7 +741,53 @@ def wants_new_action(question: str) -> bool:
     if normalized in {"exit", "quit"}:
         return True
 
-    return wants_quiz(question) or wants_study_notes(question) or wants_web_search(question)
+    return (
+        wants_quiz(question)
+        or wants_study_notes(question)
+        or wants_web_search(question)
+        or wants_heartbeat_command(question)
+    )
+
+
+def wants_heartbeat_command(question: str) -> bool:
+    """Detect weekly heartbeat schedule commands."""
+
+    normalized = question.lower()
+    return "heartbeat" in normalized and any(
+        word in normalized
+        for word in ("schedule", "enable", "disable", "status", "weekly")
+    )
+
+
+def handle_heartbeat_command(question: str) -> str:
+    """Enable, disable, or show the weekly heartbeat schedule."""
+
+    normalized = question.lower()
+    schedule = load_schedule(HEARTBEAT_SCHEDULE_FILE)
+
+    if "disable" in normalized:
+        schedule["enabled"] = False
+        save_schedule(HEARTBEAT_SCHEDULE_FILE, schedule)
+        return "Weekly heartbeat disabled.\n" + format_schedule(schedule)
+
+    if "status" in normalized:
+        return format_schedule(schedule)
+
+    day, time = parse_schedule_request(question)
+    schedule.update(
+        {
+            "enabled": True,
+            "day": day,
+            "time": time,
+            "action": "weekly_study_summary",
+        }
+    )
+    save_schedule(HEARTBEAT_SCHEDULE_FILE, schedule)
+    return (
+        "Weekly heartbeat scheduled. To execute it automatically, call "
+        "`python agent/tools/weekly_heartbeat.py` from Windows Task Scheduler or cron.\n"
+        + format_schedule(schedule)
+    )
 
 
 def extract_study_notes_topic(

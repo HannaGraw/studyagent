@@ -1,0 +1,7 @@
+{
+  "enabled": false,
+  "day": "Sunday",
+  "time": "18:00",
+  "action": "weekly_study_summary",
+  "last_run_date": ""
+}
