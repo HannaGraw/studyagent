@@ -24,6 +24,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from tools.context_audit import build_context_audit, format_context_audit
 from tools.create_study_notes import create_study_note
 from tools.search_documents import (
     build_index,
@@ -119,9 +120,19 @@ FOLLOW_UP_CUES = (
     "tell me more",
     "give an example",
     "examples",
+    "interesting",
     "that",
     "this",
     "it",
+)
+
+VAGUE_TOPIC_REFERENCES = (
+    "this topic",
+    "that topic",
+    "this",
+    "that",
+    "it",
+    "the topic",
 )
 
 
@@ -187,15 +198,30 @@ def main() -> None:
             else:
                 print(f"- No web context retrieved ({web_reason}).")
 
+        memory_context = read_memory(MEMORY_FILE)
+        context_audit = format_context_audit(
+            build_context_audit(
+                chunks=chunks,
+                web_results=web_results,
+                web_reason=web_reason,
+                memory_text=memory_context,
+                conversation_history=conversation_history,
+                follow_up_used=retrieval_query != retrieval_question,
+                fallback_reason=fallback_reason,
+            )
+        )
+        print(context_audit)
+
         if wants_study_notes(question):
             print("Skill: study_notes...")
             created_study_notes = True
             answer, note_path = create_study_notes_answer(
-                retrieval_question,
+                question,
                 chunks,
                 web_results,
                 web_reason,
                 conversation_history,
+                context_audit,
             )
             if note_path:
                 print(f"- Saved {note_path.relative_to(BASE_DIR)}")
@@ -210,6 +236,7 @@ def main() -> None:
                 web_results,
                 web_reason,
                 conversation_history,
+                context_audit,
             )
         print(answer)
 
@@ -239,6 +266,7 @@ def answer_question(
     web_results: list | None = None,
     web_reason: str | None = None,
     conversation_history: list[dict[str, str]] | None = None,
+    context_audit: str = "",
 ) -> str:
     """
     Ask Berget's OpenAI-compatible chat API to answer with retrieved context.
@@ -272,6 +300,7 @@ def answer_question(
         "If neither source has enough context, say so honestly.\n\n"
         f"Student memory:\n{memory_context}\n\n"
         f"Recent conversation:\n{history_context}\n\n"
+        f"{context_audit}\n\n"
         f"Retrieved context:\n{context}\n\n"
         f"Student question: {question}"
     )
@@ -293,10 +322,11 @@ def create_study_notes_answer(
     web_results: list | None = None,
     web_reason: str | None = None,
     conversation_history: list[dict[str, str]] | None = None,
+    context_audit: str = "",
 ) -> tuple[str, Path | None]:
     """Generate structured study notes and save them as a Markdown artifact."""
 
-    topic = extract_study_notes_topic(question)
+    topic = extract_study_notes_topic(question, conversation_history or [])
     source_context = build_source_context(chunks, web_results, web_reason)
     memory_context = read_memory(MEMORY_FILE)
     history_context = format_conversation_history(conversation_history or [])
@@ -327,6 +357,7 @@ def create_study_notes_answer(
         "examples, summary table, practice questions with brief answers, and related topics.\n\n"
         f"Student memory:\n{memory_context}\n\n"
         f"Recent conversation:\n{history_context}\n\n"
+        f"{context_audit}\n\n"
         f"Retrieved context:\n{source_context}"
     )
 
@@ -495,7 +526,13 @@ def query_for_retrieval(
     if retrieval_question != question:
         return retrieval_question
 
-    if not conversation_history or not looks_like_follow_up(question):
+    if not conversation_history:
+        return question
+
+    if wants_study_notes(question) and has_vague_topic_reference(question):
+        return conversation_history[-1]["student"]
+
+    if not looks_like_follow_up(question):
         return question
 
     previous_user = conversation_history[-1]["student"]
@@ -533,14 +570,20 @@ def wants_study_notes(question: str) -> bool:
     )
 
 
-def extract_study_notes_topic(question: str) -> str:
+def extract_study_notes_topic(
+    question: str,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> str:
     """Extract a compact topic from a study-notes request."""
 
     topic = question.strip().rstrip(".?!")
     cleanup_patterns = (
         r"^please\s+",
+        r"^interesting,?\s+",
         r"^can you\s+",
         r"^could you\s+",
+        r"^make\s+me\s+some\s+study\s+notes\s+(about|on|for)\s+",
+        r"^make\s+some\s+study\s+notes\s+(about|on|for)\s+",
         r"^create\s+study\s+notes\s+(about|on|for)\s+",
         r"^make\s+study\s+notes\s+(about|on|for)\s+",
         r"^generate\s+study\s+notes\s+(about|on|for)\s+",
@@ -558,7 +601,33 @@ def extract_study_notes_topic(question: str) -> str:
     for pattern in cleanup_patterns:
         topic = re.sub(pattern, "", topic, flags=re.IGNORECASE)
 
-    return topic.strip() or question.strip()
+    topic = topic.strip()
+    if has_vague_topic_reference(topic) and conversation_history:
+        return infer_topic_from_history(conversation_history)
+
+    return topic or infer_topic_from_history(conversation_history or []) or question.strip()
+
+
+def has_vague_topic_reference(text: str) -> bool:
+    """Detect requests that refer back to the previous topic."""
+
+    normalized = text.lower().strip(" .?!,")
+    return normalized in VAGUE_TOPIC_REFERENCES or any(
+        reference in normalized for reference in ("this topic", "that topic", "the topic")
+    )
+
+
+def infer_topic_from_history(conversation_history: list[dict[str, str]]) -> str:
+    """Use the previous substantive user turn as a readable note topic."""
+
+    if not conversation_history:
+        return ""
+
+    previous = conversation_history[-1]["student"].strip().rstrip(".?!")
+    previous = re.sub(r"^(what|why|how|when|where|who)\s+(is|are|does|do|did|was|were)\s+", "", previous, flags=re.IGNORECASE)
+    previous = re.sub(r"^(can you|could you|please)\s+", "", previous, flags=re.IGNORECASE)
+    previous = re.sub(r"\?$", "", previous).strip()
+    return previous or conversation_history[-1]["student"].strip()
 
 
 def format_conversation_history(history: list[dict[str, str]], max_turns: int = 4) -> str:
