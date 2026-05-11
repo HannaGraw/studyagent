@@ -96,11 +96,10 @@ From the repository root:
 python agent/main.py
 ```
 
-If your shell points to the wrong Python environment, use the direct Conda
-interpreter path:
+If your shell points to the wrong Python environment, run through Conda:
 
 ```powershell
-C:\Users\hgpnl\anaconda3\envs\ir-a2\python.exe agent/main.py
+conda run -n ir-a2 python agent/main.py
 ```
 
 The agent indexes course material on startup and then accepts interactive
