@@ -9,6 +9,9 @@ Configuration:
     BERGET_API_KEY      required for model answers
     BERGET_BASE_URL     optional, defaults to https://api.berget.ai/v1
     BERGET_MODEL        optional, defaults to Mistral Small 3.2
+    TAVILY_API_KEY      optional, enables web-search fallback
+    WEB_SEARCH_ENABLED  optional, set false to disable web search
+    LOCAL_CONTEXT_MIN_SCORE optional, defaults to 0.10
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from tools.search_documents import (
     search_documents,
 )
 from tools.update_memory import update_memory
+from tools.web_search import format_web_results_for_prompt, search_web
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -36,6 +40,7 @@ AGENT_FILE = BASE_DIR / "agent.md"
 SOUL_FILE = BASE_DIR / "soul.md"
 ENV_FILE = BASE_DIR.parent / ".env"
 DEFAULT_BERGET_MODEL = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
+DEFAULT_LOCAL_CONTEXT_MIN_SCORE = 0.10
 
 CONFUSION_PHRASES = (
     "i don't get",
@@ -49,6 +54,28 @@ CONFUSION_PHRASES = (
     "still confused",
     "doesn't make sense",
     "does not make sense",
+)
+
+WEB_SEARCH_REQUEST_PHRASES = (
+    "search the web",
+    "web search",
+    "search online",
+    "look it up",
+    "google it",
+    "use the web",
+    "internet search",
+)
+
+GENERAL_WEB_FALLBACK_PHRASES = (
+    "how long has",
+    "how long have",
+    "when did",
+    "when was",
+    "who won",
+    "latest",
+    "current",
+    "today",
+    "recent",
 )
 
 
@@ -77,21 +104,44 @@ def main() -> None:
         if not question:
             continue
 
-        print("\nGoal: answer using local course material.")
+        retrieval_question = question_for_retrieval(question, previous_questions)
+        explicit_web_request = wants_web_search(question)
+        if retrieval_question != question:
+            print(f"\nGoal: answer previous question with web search: {retrieval_question}")
+        else:
+            print("\nGoal: answer using local course material.")
 
         print("Retrieve: searching course_material/...")
-        chunks = search_documents(question, COURSE_DIR, top_k=3)
+        chunks = search_documents(retrieval_question, COURSE_DIR, top_k=3)
+        web_results = []
+        web_reason = None
+        use_web_fallback, fallback_reason = should_use_web_fallback(
+            retrieval_question,
+            chunks,
+            explicit_web_request,
+        )
         if chunks:
             for chunk in chunks:
                 print(f"- {chunk.source} chunk {chunk.chunk_id} (score {chunk.score:.4f})")
         else:
             print("- No relevant chunks found.")
 
+        if use_web_fallback:
+            if chunks:
+                print(f"- Local context looks weak ({fallback_reason}).")
+            print("Skill: web_search fallback...")
+            web_results, web_reason = search_web(retrieval_question, max_results=3)
+            if web_results:
+                for result in web_results:
+                    print(f"- {result.title} ({result.url})")
+            else:
+                print(f"- No web context retrieved ({web_reason}).")
+
         print("Answer:")
-        answer = answer_question(question, chunks)
+        answer = answer_question(retrieval_question, chunks, web_results, web_reason)
         print(answer)
 
-        should_update, reason = should_update_memory(question, previous_questions)
+        should_update, reason = should_update_memory(retrieval_question, previous_questions)
         print("Memory update:")
         if should_update:
             update_memory(MEMORY_FILE, question, reason)
@@ -99,11 +149,16 @@ def main() -> None:
         else:
             print("- No update needed.")
 
-        previous_questions.append(question)
+        previous_questions.append(retrieval_question)
         print()
 
 
-def answer_question(question: str, chunks: list) -> str:
+def answer_question(
+    question: str,
+    chunks: list,
+    web_results: list | None = None,
+    web_reason: str | None = None,
+) -> str:
     """
     Ask Berget's OpenAI-compatible chat API to answer with retrieved context.
 
@@ -111,9 +166,30 @@ def answer_question(question: str, chunks: list) -> str:
     demonstrates retrieval and memory behavior.
     """
 
-    context = format_chunks_for_prompt(chunks)
-    if not context:
-        context = "No relevant course context was retrieved."
+    course_context = format_chunks_for_prompt(chunks)
+    external_context = format_web_results_for_prompt(web_results or [])
+
+    if course_context and external_context:
+        context = (
+            "Course context, retrieved first:\n"
+            f"{course_context}\n\n"
+            "External web context from the web_search skill, retrieved because local context looked weak:\n"
+            f"{external_context}"
+        )
+    elif course_context:
+        context = f"Course context:\n{course_context}"
+    elif external_context:
+        context = (
+            "No relevant course context was retrieved.\n\n"
+            "External web context from the web_search skill:\n"
+            f"{external_context}"
+        )
+    else:
+        reason = web_reason or "web search was not attempted"
+        context = (
+            "No relevant course context was retrieved.\n"
+            f"No external web context was retrieved because {reason}."
+        )
 
     api_key = os.getenv("BERGET_API_KEY")
     if not api_key:
@@ -129,7 +205,11 @@ def answer_question(question: str, chunks: list) -> str:
         + SOUL_FILE.read_text(encoding="utf-8")
     )
     user_prompt = (
-        "Use only the retrieved course context unless you clearly say the context is insufficient.\n\n"
+        "Use course context as the primary source of truth.\n"
+        "If external web context is provided, use it when the course context is missing or incomplete, "
+        "and clearly say which parts are based on web search rather than the uploaded material.\n"
+        "Do not ask permission to search the web; if web context is present, the search has already happened.\n"
+        "If neither source has enough context, say so honestly.\n\n"
         f"Retrieved context:\n{context}\n\n"
         f"Student question: {question}"
     )
@@ -165,6 +245,47 @@ def answer_question(question: str, chunks: list) -> str:
         )
 
     return data["choices"][0]["message"]["content"].strip()
+
+
+def should_use_web_fallback(
+    question: str,
+    chunks: list,
+    explicit_web_request: bool = False,
+) -> tuple[bool, str]:
+    """Decide whether local retrieval is too weak and web search should run."""
+
+    if explicit_web_request:
+        return True, "the student explicitly requested web search"
+
+    if not chunks:
+        return True, "no local chunks found"
+
+    normalized = question.lower()
+    if any(phrase in normalized for phrase in GENERAL_WEB_FALLBACK_PHRASES):
+        return True, "the question asks for broad or time-sensitive external context"
+
+    min_score = float(os.getenv("LOCAL_CONTEXT_MIN_SCORE", DEFAULT_LOCAL_CONTEXT_MIN_SCORE))
+    best_score = max(chunk.score for chunk in chunks)
+    if best_score < min_score:
+        return True, f"best local score {best_score:.4f} is below {min_score:.4f}"
+
+    return False, ""
+
+
+def question_for_retrieval(question: str, previous_questions: list[str]) -> str:
+    """Use the previous substantive question when the student asks to search web."""
+
+    if wants_web_search(question) and previous_questions:
+        return previous_questions[-1]
+
+    return question
+
+
+def wants_web_search(question: str) -> bool:
+    """Detect direct requests to use external web search."""
+
+    normalized = question.lower()
+    return any(phrase in normalized for phrase in WEB_SEARCH_REQUEST_PHRASES)
 
 
 def should_update_memory(question: str, previous_questions: list[str]) -> tuple[bool, str]:

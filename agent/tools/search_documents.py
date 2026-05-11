@@ -21,6 +21,38 @@ SUPPORTED_EXTENSIONS = {".txt", ".md", ".py", ".csv", ".pdf"}
 INDEX_FILENAME = ".document_index.json"
 CHUNK_WORDS = 180
 CHUNK_OVERLAP = 40
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "i",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "was",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+}
 
 
 @dataclass
@@ -212,7 +244,11 @@ def _chunk_text(text: str) -> Iterable[str]:
 
 
 def _tokenize(text: str) -> list[str]:
-    return re.findall(r"[a-zA-Z0-9_]+", text.lower())
+    return [
+        token
+        for token in re.findall(r"[a-zA-Z0-9_]+", text.lower())
+        if token not in STOPWORDS
+    ]
 
 
 if __name__ == "__main__":
