@@ -101,17 +101,85 @@ def build_index(course_dir: Path) -> dict:
                 }
             )
 
-    document_frequency = defaultdict(int)
-    for chunk in chunks:
-        for term in chunk["term_counts"]:
-            document_frequency[term] += 1
+    document_frequency = _document_frequency(chunks)
 
     return {
         "chunk_count": len(chunks),
         "chunks": chunks,
         "document_frequency": dict(document_frequency),
         "skipped_files": skipped_files,
+        "files": {
+            str(path.relative_to(course_dir)): _file_metadata(path)
+            for path in sorted(_iter_course_files(course_dir))
+        },
     }
+
+
+def build_or_update_index(course_dir: Path) -> dict:
+    """
+    Incrementally update the saved index.
+
+    Unchanged files keep their existing chunks. New or modified files are read,
+    chunked, and merged into the index. Deleted files are removed.
+    """
+
+    course_dir = Path(course_dir)
+    index_path = course_dir / INDEX_FILENAME
+    if not index_path.exists():
+        index = build_index(course_dir)
+        save_index(course_dir, index)
+        return index
+
+    old_index = json.loads(index_path.read_text(encoding="utf-8"))
+    old_files = old_index.get("files", {})
+    old_chunks_by_source = defaultdict(list)
+    for chunk in old_index.get("chunks", []):
+        old_chunks_by_source[chunk.get("source", "")].append(chunk)
+
+    chunks = []
+    skipped_files = []
+    files = {}
+    changed_sources = []
+
+    for path in sorted(_iter_course_files(course_dir)):
+        source = str(path.relative_to(course_dir))
+        metadata = _file_metadata(path)
+        files[source] = metadata
+
+        if old_files.get(source) == metadata and old_chunks_by_source.get(source):
+            chunks.extend(old_chunks_by_source[source])
+            continue
+
+        changed_sources.append(source)
+        text, skip_reason = _read_course_file(path)
+        if skip_reason:
+            skipped_files.append({"source": source, "reason": skip_reason})
+            continue
+
+        for chunk_id, chunk_text in enumerate(_chunk_text(text)):
+            tokens = _tokenize(chunk_text)
+            if not tokens:
+                continue
+            chunks.append(
+                {
+                    "source": source,
+                    "chunk_id": chunk_id,
+                    "text": chunk_text,
+                    "term_counts": dict(Counter(tokens)),
+                }
+            )
+
+    document_frequency = _document_frequency(chunks)
+    index = {
+        "chunk_count": len(chunks),
+        "chunks": chunks,
+        "document_frequency": dict(document_frequency),
+        "skipped_files": skipped_files,
+        "files": files,
+        "updated_files": changed_sources,
+    }
+    save_index(course_dir, index)
+    return index
 
 
 def save_index(course_dir: Path, index: dict) -> None:
@@ -133,9 +201,7 @@ def load_or_build_index(course_dir: Path) -> dict:
     if index_path.exists():
         return json.loads(index_path.read_text(encoding="utf-8"))
 
-    index = build_index(course_dir)
-    save_index(course_dir, index)
-    return index
+    return build_or_update_index(course_dir)
 
 
 def search_documents(query: str, course_dir: Path, top_k: int = 3) -> list[RetrievedChunk]:
@@ -148,7 +214,7 @@ def search_documents(query: str, course_dir: Path, top_k: int = 3) -> list[Retri
     - normalize slightly by chunk length
     """
 
-    index = load_or_build_index(course_dir)
+    index = build_or_update_index(course_dir)
     query_terms = _tokenize(query)
     if not query_terms:
         return []
@@ -194,6 +260,14 @@ def format_chunks_for_prompt(chunks: Iterable[RetrievedChunk]) -> str:
     return "\n\n".join(parts)
 
 
+def _document_frequency(chunks: list[dict]) -> defaultdict:
+    document_frequency = defaultdict(int)
+    for chunk in chunks:
+        for term in chunk["term_counts"]:
+            document_frequency[term] += 1
+    return document_frequency
+
+
 def _iter_course_files(course_dir: Path) -> Iterable[Path]:
     if not course_dir.exists():
         return []
@@ -204,6 +278,15 @@ def _iter_course_files(course_dir: Path) -> Iterable[Path]:
         and path.suffix.lower() in SUPPORTED_EXTENSIONS
         and path.name != INDEX_FILENAME
     )
+
+
+def _file_metadata(path: Path) -> dict:
+    stat = path.stat()
+    return {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "suffix": path.suffix.lower(),
+    }
 
 
 def _read_course_file(path: Path) -> tuple[str, str | None]:

@@ -19,6 +19,7 @@ Configuration:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -31,6 +32,7 @@ from tools.context_audit import build_context_audit, format_context_audit
 from tools.create_study_notes import create_study_note
 from tools.heartbeat_schedule import format_schedule, load_schedule, parse_schedule_request, save_schedule
 from tools.search_documents import (
+    build_or_update_index,
     build_index,
     format_chunks_for_prompt,
     save_index,
@@ -156,13 +158,22 @@ VAGUE_TOPIC_REFERENCES = (
 def main() -> None:
     """Run a tiny interactive tutor session."""
 
+    args = parse_args()
     load_env_file(ENV_FILE)
     ensure_workspace()
 
-    print("Indexing course material...")
-    index = build_index(COURSE_DIR)
-    save_index(COURSE_DIR, index)
-    print(f"Indexed {index['chunk_count']} chunks from {COURSE_DIR}.")
+    if args.reindex:
+        print("Reindexing course material...")
+        index = build_index(COURSE_DIR)
+        save_index(COURSE_DIR, index)
+    else:
+        print("Checking course material index...")
+        index = build_or_update_index(COURSE_DIR)
+    print(f"Indexed {index['chunk_count']} chunks from {COURSE_DIR.relative_to(BASE_DIR)}.")
+    if index.get("updated_files"):
+        print("Indexed new or changed files:")
+        for source in index["updated_files"]:
+            print(f"- {source}")
     if index.get("skipped_files"):
         print("Skipped some files:")
         for skipped_file in index["skipped_files"]:
@@ -311,6 +322,18 @@ def main() -> None:
         previous_questions.append(retrieval_question)
         remember_turn(conversation_history, question, answer)
         print()
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line flags for the interactive agent."""
+
+    parser = argparse.ArgumentParser(description="Run the course-grounded study agent.")
+    parser.add_argument(
+        "--reindex",
+        action="store_true",
+        help="Rebuild the course-material index before starting.",
+    )
+    return parser.parse_args()
 
 
 def answer_question(

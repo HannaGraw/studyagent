@@ -102,8 +102,14 @@ If your shell points to the wrong Python environment, run through Conda:
 conda run -n ir-a2 python agent/main.py
 ```
 
-The agent indexes course material on startup and then accepts interactive
-commands.
+The agent checks the course-material index on startup and then accepts
+interactive commands. By default, indexing is incremental: unchanged files are
+reused, and new or modified files are indexed automatically. If you want to
+force a complete rebuild, run:
+
+```powershell
+python agent/main.py --reindex
+```
 
 ## Example Prompts
 
