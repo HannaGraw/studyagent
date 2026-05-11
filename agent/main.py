@@ -55,6 +55,12 @@ ENV_FILE = BASE_DIR.parent / ".env"
 DEFAULT_OPENAI_BASE_URL = "https://api.berget.ai/v1"
 DEFAULT_OPENAI_MODEL = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
 DEFAULT_LOCAL_CONTEXT_MIN_SCORE = 0.10
+CITATION_INSTRUCTIONS = (
+    "Citation style: never use XML-style tags such as [REF]...[/REF]. "
+    "When citing retrieved context, use plain text such as "
+    "'Source: filename.pdf, chunk 3'. If several chunks support the same point, "
+    "write them as plain text sources."
+)
 
 CONFUSION_PHRASES = (
     "i don't get",
@@ -197,7 +203,13 @@ def main() -> None:
             print()
             continue
 
-        if pending_quiz and not wants_new_action(question):
+        if pending_quiz and wants_cancel_quiz(question):
+            print(f"\nQuiz cancelled for {pending_quiz['topic']}.")
+            pending_quiz = None
+            print()
+            continue
+
+        if pending_quiz and not wants_new_action_while_quiz_pending(question):
             print(f"\nGoal: grade quiz answer for {pending_quiz['topic']}.")
             answer = grade_quiz_answer(question, pending_quiz, conversation_history)
             print(answer)
@@ -276,6 +288,7 @@ def main() -> None:
                 "quiz": answer,
                 "context": build_source_context(chunks, web_results, web_reason),
             }
+            print("- Quiz state: waiting for your next message as the answer.")
         elif wants_study_notes(question):
             print("Skill: study_notes...")
             created_study_notes = True
@@ -373,6 +386,7 @@ def answer_question(
         "If external web context is provided, use it when the course context is missing or incomplete, "
         "and clearly say which parts are based on web search rather than the uploaded material.\n"
         "Do not ask permission to search the web; if web context is present, the search has already happened.\n"
+        f"{CITATION_INSTRUCTIONS}\n"
         "If neither source has enough context, say so honestly.\n\n"
         f"Student memory:\n{memory_context}\n\n"
         f"Recent conversation:\n{history_context}\n\n"
@@ -428,6 +442,7 @@ def create_study_notes_answer(
         "Use the retrieved course context as the primary source. If external web context is present, "
         "clearly label it as web context. If context is insufficient, say what is missing.\n"
         "Return only the Markdown note content. Do not mention that you saved a file, and do not invent a file path.\n"
+        f"{CITATION_INSTRUCTIONS}\n"
         "Use plain ASCII characters for formulas and symbols.\n"
         "Use this structure: title, source note, key concepts, one Mermaid diagram if useful, "
         "examples, summary table, practice questions with brief answers, and related topics.\n\n"
@@ -484,6 +499,7 @@ def create_quiz_answer(
         f"Create a short diagnostic quiz for this topic: {topic}\n\n"
         "Return exactly 3 numbered questions. Do not include the answers yet. "
         "Ask the student to answer all three in their next message.\n\n"
+        f"{CITATION_INSTRUCTIONS}\n\n"
         f"Student memory:\n{memory_context}\n\n"
         f"Mastery memory:\n{mastery_context}\n\n"
         f"Recent conversation:\n{history_context}\n\n"
@@ -528,6 +544,7 @@ def grade_quiz_answer(
         f"Grade this quiz answer for topic: {pending_quiz['topic']}\n\n"
         "Return: score out of 3, mastery label, per-question feedback, error notes, "
         "and one targeted next study action.\n\n"
+        f"{CITATION_INSTRUCTIONS}\n\n"
         f"Quiz:\n{pending_quiz['quiz']}\n\n"
         f"Student answer:\n{student_answer}\n\n"
         f"Source context used to create quiz:\n{pending_quiz['context']}\n\n"
@@ -770,6 +787,60 @@ def wants_new_action(question: str) -> bool:
         or wants_web_search(question)
         or wants_heartbeat_command(question)
     )
+
+
+def wants_cancel_quiz(question: str) -> bool:
+    """Detect clear requests to stop grading the pending quiz."""
+
+    normalized = question.lower().strip(" .?!")
+    return normalized in {
+        "cancel quiz",
+        "skip quiz",
+        "stop quiz",
+        "end quiz",
+        "never mind",
+        "nevermind",
+    }
+
+
+def wants_new_action_while_quiz_pending(question: str) -> bool:
+    """
+    Detect only clear commands that should interrupt a pending quiz.
+
+    During a quiz, most student messages are answers. This narrower detector
+    prevents an answer from accidentally being treated as a fresh retrieval task.
+    """
+
+    normalized = question.lower().strip()
+    if normalized in {"exit", "quit"}:
+        return True
+
+    explicit_starts = (
+        "new quiz",
+        "start a new quiz",
+        "quiz me",
+        "test me",
+        "drill me",
+        "give me a quiz",
+        "make me a quiz",
+        "ask me questions",
+        "create study notes",
+        "make study notes",
+        "generate study notes",
+        "write study notes",
+        "create notes",
+        "make notes",
+        "write notes",
+        "search the web",
+        "web search",
+        "search online",
+        "look it up",
+        "use the web",
+    )
+    if normalized.startswith(explicit_starts):
+        return True
+
+    return wants_heartbeat_command(question)
 
 
 def wants_heartbeat_command(question: str) -> bool:

@@ -1,0 +1,112 @@
+\documentclass[10pt,a4paper]{article}
+
+\usepackage[margin=2cm]{geometry}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{titlesec}
+
+\titleformat{\section}{\normalfont\bfseries}{\thesection}{0.5em}{}
+\setlist[itemize]{noitemsep, topsep=2pt}
+
+\title{A Course-Grounded AI Study Agent with Retrieval, Memory, Skills, and Context Auditing}
+\author{Hanna Graw}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\noindent
+\textbf{GitHub repository:} \url{https://github.com/HannaGraw/studyagent} \\
+\textbf{Video demonstration:} \url{https://drive.google.com/file/d/1zk_HUgiR-SHv3l-GaML1bcJrh4imew-7/view?usp=sharing}
+
+\section{Introduction}
+
+The goal of this project was to build and extend an AI agent in order to better understand how agent architectures fit into Information Retrieval (IR). The result is a course-grounded study agent that answers questions from uploaded course material, supports optional web search, remembers student difficulties, creates study artifacts, runs quizzes, and tracks mastery. It is runnable with an OpenAI-compatible chat-completions API through \texttt{OPENAI\_API\_KEY}, \texttt{OPENAI\_BASE\_URL}, and \texttt{OPENAI\_MODEL}; in this project Berget AI is used as the provider.
+
+The agent follows an explicit loop: retrieve context, decide whether tools are needed, answer or act, and update memory. This makes the system inspectable and easy to extend.
+
+\section{System Architecture}
+
+The agent checks an incremental index of local course material from \texttt{agent/course\_material/}. PDFs are extracted with \texttt{pypdf}, chunked, tokenized, and searched using a lightweight lexical scoring method. Unchanged files are reused between runs, while new or modified files are indexed automatically. This is the primary IR layer, and course material is always preferred over external information.
+
+The system also includes optional Tavily web search, used only when local retrieval is weak, missing, or explicitly requested. Without \texttt{TAVILY\_API\_KEY}, the agent still runs with local retrieval and the OpenAI-compatible model API. The main extensions are:
+
+\begin{itemize}
+    \item local document retrieval, optional web search, and conversation history;
+    \item file-based memory for struggles and quiz-based mastery tracking;
+    \item study-note generation, quiz tutoring, and an opt-in weekly heartbeat.
+\end{itemize}
+
+\section{Information Retrieval Extensions}
+
+Instead of sending all course material to the model, the agent retrieves only relevant chunks for each query. This improves grounding, reduces prompt size, and makes the answer source visible.
+
+Memory is also treated as an IR resource. \texttt{agent/memory/struggles.md} stores confusion, repeated questions, and weak retrieval cases, while \texttt{agent/memory/mastery.md} stores quiz results. These files are read into later prompts so the agent can adapt to the student's learning history. Actions such as study-note creation and quiz grading also create new information artifacts that support later study.
+
+\section{OpenClaw-Inspired Novelty: Context Auditing}
+
+For the distinction-oriented part of the project, I drew inspiration from OpenClaw-style architectures, especially memory, tools, skills, heartbeat, and layered context. A risk with such systems is opacity: the user may not know whether an answer came from course material, memory, web search, or previous conversation.
+
+To improve this, I implemented a \textbf{context audit} skill. Before answering, the agent prints a short provenance report:
+
+\begin{itemize}
+    \item whether course retrieval was used and which sources were retrieved;
+    \item whether web search was used, skipped, or failed;
+    \item whether memory was included;
+    \item whether conversation history was used;
+    \item what the planned grounding of the answer is.
+\end{itemize}
+
+This makes the agent a provenance-aware study assistant. The audit is included in the model prompt, and the answer prompt asks for readable plain-text source references instead of opaque citation tags. The student can inspect why an answer was produced and decide whether to trust it.
+
+\section{Heartbeat and Scheduling}
+
+The project also includes an opt-in weekly heartbeat, disabled by default to avoid unwanted API calls. The user can schedule it from the interactive agent, for example:
+
+\begin{quote}
+\texttt{Schedule weekly heartbeat every Sunday at 18:00}
+\end{quote}
+
+The schedule is stored in \texttt{agent/memory/heartbeat\_schedule.json}. A standalone script can be run manually or through cron/Windows Task Scheduler. When due, it reads memory, mastery data, generated notes, and \texttt{agent/heartbeat.md}, then writes \texttt{agent/memory/weekly\_reports.md}. This gives the agent a safe form of proactive behavior without running continuously.
+
+\section{Conclusion}
+
+The final system fulfills the assignment requirements by extending an AI agent with multiple IR-oriented tools and actions: local retrieval, optional web search, memory, study notes, quizzes, mastery tracking, context auditing, and scheduled weekly summaries. It is hosted on GitHub and runnable with an OpenAI-compatible API key. The main contribution beyond a basic agent is the context audit layer, which makes retrieval and grounding transparent to the user.
+
+\section*{Reflection on Working with AI}
+
+Working with reasoning AI to complete this assignment was very interesting. I became more comfortable using the tool after being completely new to it before Assignment 1. I also started to understand the importance of prompting, since some of my initial prompts likely contained too many tokens and quickly used up my available usage.
+
+The AI was especially helpful because I could combine my own creative exploration with technical guidance. For example, I looked through possible skills on skills.sh and then discussed how they could be adapted to my own project. When I got stuck on what the next step should be, asking the AI for possible directions and starting points was also useful.
+
+At the same time, I tried to test the program myself and look for errors, since I know that AI-generated code can contain mistakes or miss edge cases. There is still a possibility that I missed things. The project could definitely be improved in terms of design and cleanliness as well as functionality and could also be extended further, but I tried to keep it as simple as possible for this assignment while still building something useful.
+
+\begin{thebibliography}{9}
+
+\bibitem{openclaw}
+OpenClaw. \textit{OpenClaw GitHub Repository}. Available at:
+\url{https://github.com/openclaw/openclaw}
+
+\bibitem{openclawcompaction}
+OpenClaw. \textit{Compaction Documentation}. Available at:
+\url{https://github.com/openclaw/openclaw/blob/main/docs/concepts/compaction.md}
+
+\bibitem{openclawmemory}
+OpenClaw. \textit{Memory Concepts}. Available at:
+\url{https://docs.openclaw.ai/concepts/memory}
+
+\bibitem{openclawtools}
+OpenClaw. \textit{Tools Documentation}. Available at:
+\url{https://docs.openclaw.ai/tools}
+
+\bibitem{openclawskills}
+OpenClaw. \textit{Skills Documentation}. Available at:
+\url{https://docs.openclaw.ai/tools/skills}
+
+\bibitem{openclawheartbeat}
+OpenClaw. \textit{Heartbeat Documentation}. Available at:
+\url{https://docs.openclaw.ai/gateway/heartbeat}
+
+\end{thebibliography}
+
+\end{document}

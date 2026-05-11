@@ -14,6 +14,8 @@ endpoint.
 
 GitHub: <https://github.com/HannaGraw/studyagent>
 
+Demo video: <https://drive.google.com/file/d/1zk_HUgiR-SHv3l-GaML1bcJrh4imew-7/view?usp=sharing>
+
 ## Features
 
 - Local course-material retrieval from files in `agent/course_material/`.
