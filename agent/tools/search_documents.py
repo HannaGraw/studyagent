@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-SUPPORTED_EXTENSIONS = {".txt", ".md", ".py", ".csv"}
+SUPPORTED_EXTENSIONS = {".txt", ".md", ".py", ".csv", ".pdf"}
 INDEX_FILENAME = ".document_index.json"
 CHUNK_WORDS = 180
 CHUNK_OVERLAP = 40
@@ -43,9 +43,19 @@ def build_index(course_dir: Path) -> dict:
 
     course_dir = Path(course_dir)
     chunks = []
+    skipped_files = []
 
     for path in sorted(_iter_course_files(course_dir)):
-        text = path.read_text(encoding="utf-8", errors="ignore")
+        text, skip_reason = _read_course_file(path)
+        if skip_reason:
+            skipped_files.append(
+                {
+                    "source": str(path.relative_to(course_dir)),
+                    "reason": skip_reason,
+                }
+            )
+            continue
+
         for chunk_id, chunk_text in enumerate(_chunk_text(text)):
             tokens = _tokenize(chunk_text)
             if not tokens:
@@ -68,6 +78,7 @@ def build_index(course_dir: Path) -> dict:
         "chunk_count": len(chunks),
         "chunks": chunks,
         "document_frequency": dict(document_frequency),
+        "skipped_files": skipped_files,
     }
 
 
@@ -163,6 +174,31 @@ def _iter_course_files(course_dir: Path) -> Iterable[Path]:
     )
 
 
+def _read_course_file(path: Path) -> tuple[str, str | None]:
+    if path.suffix.lower() == ".pdf":
+        return _read_pdf(path)
+
+    return path.read_text(encoding="utf-8", errors="ignore"), None
+
+
+def _read_pdf(path: Path) -> tuple[str, str | None]:
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return "", "PDF support requires installing pypdf"
+
+    reader = PdfReader(path)
+    pages = []
+    for page in reader.pages:
+        pages.append(page.extract_text() or "")
+
+    text = "\n".join(pages)
+    if not text.strip():
+        return "", "no extractable text found"
+
+    return text, None
+
+
 def _chunk_text(text: str) -> Iterable[str]:
     words = text.split()
     if not words:
@@ -184,4 +220,3 @@ if __name__ == "__main__":
     index = build_index(base_dir / "course_material")
     save_index(base_dir / "course_material", index)
     print(f"Indexed {index['chunk_count']} chunks.")
-

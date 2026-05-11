@@ -4,4 +4,5 @@ __pycache__/
 .venv/
 venv/
 .DS_Store
-``
+agent/course_material/.document_index.json
+agent/course_material/*.pdf

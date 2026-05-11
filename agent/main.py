@@ -6,9 +6,9 @@ The loop is intentionally visible:
 goal -> retrieve -> answer -> memory update
 
 Configuration:
-    OPENAI_API_KEY      required for model answers
-    OPENAI_BASE_URL     optional, defaults to https://api.openai.com/v1
-    OPENAI_MODEL        optional, defaults to gpt-4o-mini
+    BERGET_API_KEY      required for model answers
+    BERGET_BASE_URL     optional, defaults to https://api.berget.ai/v1
+    BERGET_MODEL        optional, defaults to Mistral Small 3.2
 """
 
 from __future__ import annotations
@@ -34,6 +34,8 @@ COURSE_DIR = BASE_DIR / "course_material"
 MEMORY_FILE = BASE_DIR / "memory" / "struggles.md"
 AGENT_FILE = BASE_DIR / "agent.md"
 SOUL_FILE = BASE_DIR / "soul.md"
+ENV_FILE = BASE_DIR.parent / ".env"
+DEFAULT_BERGET_MODEL = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
 
 CONFUSION_PHRASES = (
     "i don't get",
@@ -53,12 +55,17 @@ CONFUSION_PHRASES = (
 def main() -> None:
     """Run a tiny interactive tutor session."""
 
+    load_env_file(ENV_FILE)
     ensure_workspace()
 
     print("Indexing course material...")
     index = build_index(COURSE_DIR)
     save_index(COURSE_DIR, index)
     print(f"Indexed {index['chunk_count']} chunks from {COURSE_DIR}.")
+    if index.get("skipped_files"):
+        print("Skipped some files:")
+        for skipped_file in index["skipped_files"]:
+            print(f"- {skipped_file['source']}: {skipped_file['reason']}")
     print("Ask a question, or type 'exit' to stop.\n")
 
     previous_questions: list[str] = []
@@ -98,7 +105,7 @@ def main() -> None:
 
 def answer_question(question: str, chunks: list) -> str:
     """
-    Ask an OpenAI-compatible chat model to answer with retrieved context.
+    Ask Berget's OpenAI-compatible chat API to answer with retrieved context.
 
     If no API key is configured, return a clear local fallback so the loop still
     demonstrates retrieval and memory behavior.
@@ -108,10 +115,10 @@ def answer_question(question: str, chunks: list) -> str:
     if not context:
         context = "No relevant course context was retrieved."
 
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("BERGET_API_KEY")
     if not api_key:
         return (
-            "OPENAI_API_KEY is not set, so I cannot call the model yet.\n"
+            "BERGET_API_KEY is not set, so I cannot call the model yet.\n"
             "Retrieved context:\n"
             f"{context}"
         )
@@ -128,7 +135,7 @@ def answer_question(question: str, chunks: list) -> str:
     )
 
     payload = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "model": os.getenv("BERGET_MODEL", DEFAULT_BERGET_MODEL),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -136,7 +143,7 @@ def answer_question(question: str, chunks: list) -> str:
         "temperature": 0.2,
     }
 
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
+    base_url = os.getenv("BERGET_BASE_URL", "https://api.berget.ai/v1").rstrip("/")
     request = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -176,6 +183,24 @@ def should_update_memory(question: str, previous_questions: list[str]) -> tuple[
         return True, "repeated question"
 
     return False, ""
+
+
+def load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE lines from .env without requiring python-dotenv."""
+
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def ensure_workspace() -> None:
