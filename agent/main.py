@@ -6,9 +6,12 @@ The loop is intentionally visible:
 goal -> retrieve -> answer -> memory update
 
 Configuration:
-    BERGET_API_KEY      required for model answers
-    BERGET_BASE_URL     optional, defaults to https://api.berget.ai/v1
-    BERGET_MODEL        optional, defaults to Mistral Small 3.2
+    OPENAI_API_KEY      required for model answers
+    OPENAI_BASE_URL     optional, defaults to https://api.berget.ai/v1
+    OPENAI_MODEL        optional, defaults to Mistral Small 3.2
+    BERGET_API_KEY      optional alias for OPENAI_API_KEY
+    BERGET_BASE_URL     optional alias for OPENAI_BASE_URL
+    BERGET_MODEL        optional alias for OPENAI_MODEL
     TAVILY_API_KEY      optional, enables web-search fallback
     WEB_SEARCH_ENABLED  optional, set false to disable web search
     LOCAL_CONTEXT_MIN_SCORE optional, defaults to 0.10
@@ -32,6 +35,7 @@ from tools.search_documents import (
     save_index,
     search_documents,
 )
+from tools.update_mastery import read_mastery, update_mastery
 from tools.update_memory import read_memory, update_memory
 from tools.web_search import format_web_results_for_prompt, search_web
 
@@ -39,11 +43,13 @@ from tools.web_search import format_web_results_for_prompt, search_web
 BASE_DIR = Path(__file__).resolve().parent
 COURSE_DIR = BASE_DIR / "course_material"
 MEMORY_FILE = BASE_DIR / "memory" / "struggles.md"
+MASTERY_FILE = BASE_DIR / "memory" / "mastery.md"
 NOTES_DIR = BASE_DIR / "generated_notes"
 AGENT_FILE = BASE_DIR / "agent.md"
 SOUL_FILE = BASE_DIR / "soul.md"
 ENV_FILE = BASE_DIR.parent / ".env"
-DEFAULT_BERGET_MODEL = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
+DEFAULT_OPENAI_BASE_URL = "https://api.berget.ai/v1"
+DEFAULT_OPENAI_MODEL = "mistralai/Mistral-Small-3.2-24B-Instruct-2506"
 DEFAULT_LOCAL_CONTEXT_MIN_SCORE = 0.10
 
 CONFUSION_PHRASES = (
@@ -107,6 +113,15 @@ STUDY_NOTES_PHRASES = (
     "summarize",
 )
 
+QUIZ_REQUEST_PHRASES = (
+    "quiz me",
+    "test me",
+    "drill me",
+    "practice quiz",
+    "give me a quiz",
+    "ask me questions",
+)
+
 FOLLOW_UP_CUES = (
     "yes",
     "no",
@@ -154,12 +169,26 @@ def main() -> None:
 
     previous_questions: list[str] = []
     conversation_history: list[dict[str, str]] = []
+    pending_quiz: dict[str, str] | None = None
 
     while True:
         question = input("Student> ").strip()
         if question.lower() in {"exit", "quit"}:
             break
         if not question:
+            continue
+
+        if pending_quiz and not wants_new_action(question):
+            print(f"\nGoal: grade quiz answer for {pending_quiz['topic']}.")
+            answer = grade_quiz_answer(question, pending_quiz, conversation_history)
+            print(answer)
+            update_mastery(MASTERY_FILE, pending_quiz["topic"], answer)
+            print(f"Mastery update: updated {MASTERY_FILE.relative_to(BASE_DIR)}.")
+            update_memory(MEMORY_FILE, pending_quiz["topic"], "completed quiz attempt", answer)
+            print(f"Memory update: updated {MEMORY_FILE.relative_to(BASE_DIR)}.")
+            remember_turn(conversation_history, question, answer)
+            pending_quiz = None
+            print()
             continue
 
         retrieval_question = question_for_retrieval(question, previous_questions)
@@ -212,7 +241,23 @@ def main() -> None:
         )
         print(context_audit)
 
-        if wants_study_notes(question):
+        if wants_quiz(question):
+            print("Skill: quiz_tutor...")
+            created_study_notes = False
+            answer = create_quiz_answer(
+                question,
+                chunks,
+                web_results,
+                web_reason,
+                conversation_history,
+                context_audit,
+            )
+            pending_quiz = {
+                "topic": extract_quiz_topic(question, conversation_history),
+                "quiz": answer,
+                "context": build_source_context(chunks, web_results, web_reason),
+            }
+        elif wants_study_notes(question):
             print("Skill: study_notes...")
             created_study_notes = True
             answer, note_path = create_study_notes_answer(
@@ -269,7 +314,7 @@ def answer_question(
     context_audit: str = "",
 ) -> str:
     """
-    Ask Berget's OpenAI-compatible chat API to answer with retrieved context.
+    Ask an OpenAI-compatible chat API to answer with retrieved context.
 
     If no API key is configured, return a clear local fallback so the loop still
     demonstrates retrieval and memory behavior.
@@ -279,10 +324,10 @@ def answer_question(
     memory_context = read_memory(MEMORY_FILE)
     history_context = format_conversation_history(conversation_history or [])
 
-    api_key = os.getenv("BERGET_API_KEY")
+    api_key = get_chat_api_key()
     if not api_key:
         return (
-            "BERGET_API_KEY is not set, so I cannot call the model yet.\n"
+            "OPENAI_API_KEY is not set, so I cannot call the model yet.\n"
             "Retrieved context:\n"
             f"{context}"
         )
@@ -331,10 +376,10 @@ def create_study_notes_answer(
     memory_context = read_memory(MEMORY_FILE)
     history_context = format_conversation_history(conversation_history or [])
 
-    api_key = os.getenv("BERGET_API_KEY")
+    api_key = get_chat_api_key()
     if not api_key:
         return (
-            "BERGET_API_KEY is not set, so I cannot create study notes yet.\n"
+            "OPENAI_API_KEY is not set, so I cannot create study notes yet.\n"
             "Retrieved context:\n"
             f"{source_context}",
             None,
@@ -362,7 +407,7 @@ def create_study_notes_answer(
     )
 
     note_content = call_chat_model(system_prompt, user_prompt)
-    if note_content.startswith("Model call failed:") or note_content.startswith("BERGET_API_KEY is not set"):
+    if note_content.startswith("Model call failed:") or note_content.startswith("OPENAI_API_KEY is not set"):
         return (
             f"Could not create study notes for '{topic}'.\n"
             f"{note_content}\n\n"
@@ -379,6 +424,88 @@ def create_study_notes_answer(
         f"{note_content}"
     )
     return response, note_path
+
+
+def create_quiz_answer(
+    question: str,
+    chunks: list,
+    web_results: list | None = None,
+    web_reason: str | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
+    context_audit: str = "",
+) -> str:
+    """Generate a short interactive quiz and leave grading for the next turn."""
+
+    topic = extract_quiz_topic(question, conversation_history or [])
+    source_context = build_source_context(chunks, web_results, web_reason)
+    memory_context = read_memory(MEMORY_FILE)
+    mastery_context = read_mastery(MASTERY_FILE)
+    history_context = format_conversation_history(conversation_history or [])
+
+    system_prompt = (
+        AGENT_FILE.read_text(encoding="utf-8")
+        + "\n\n"
+        + SOUL_FILE.read_text(encoding="utf-8")
+        + "\n\n"
+        + (BASE_DIR / "skills" / "quiz_tutor.md").read_text(encoding="utf-8")
+    )
+    user_prompt = (
+        f"Create a short diagnostic quiz for this topic: {topic}\n\n"
+        "Return exactly 3 numbered questions. Do not include the answers yet. "
+        "Ask the student to answer all three in their next message.\n\n"
+        f"Student memory:\n{memory_context}\n\n"
+        f"Mastery memory:\n{mastery_context}\n\n"
+        f"Recent conversation:\n{history_context}\n\n"
+        f"{context_audit}\n\n"
+        f"Retrieved context:\n{source_context}"
+    )
+
+    quiz = call_chat_model(system_prompt, user_prompt)
+    if quiz.startswith("Model call failed:"):
+        return (
+            f"{quiz}\n"
+            "Retrieved context is shown below so the retrieval step remains inspectable:\n"
+            f"{source_context}"
+        )
+
+    return (
+        f"Quiz topic: {topic}\n\n"
+        f"{quiz}\n\n"
+        "Reply with your answers when you are ready, and I will grade them."
+    )
+
+
+def grade_quiz_answer(
+    student_answer: str,
+    pending_quiz: dict[str, str],
+    conversation_history: list[dict[str, str]] | None = None,
+) -> str:
+    """Grade a pending quiz answer and return a mastery-oriented report."""
+
+    memory_context = read_memory(MEMORY_FILE)
+    mastery_context = read_mastery(MASTERY_FILE)
+    history_context = format_conversation_history(conversation_history or [])
+
+    system_prompt = (
+        AGENT_FILE.read_text(encoding="utf-8")
+        + "\n\n"
+        + SOUL_FILE.read_text(encoding="utf-8")
+        + "\n\n"
+        + (BASE_DIR / "skills" / "quiz_tutor.md").read_text(encoding="utf-8")
+    )
+    user_prompt = (
+        f"Grade this quiz answer for topic: {pending_quiz['topic']}\n\n"
+        "Return: score out of 3, mastery label, per-question feedback, error notes, "
+        "and one targeted next study action.\n\n"
+        f"Quiz:\n{pending_quiz['quiz']}\n\n"
+        f"Student answer:\n{student_answer}\n\n"
+        f"Source context used to create quiz:\n{pending_quiz['context']}\n\n"
+        f"Student memory:\n{memory_context}\n\n"
+        f"Mastery memory:\n{mastery_context}\n\n"
+        f"Recent conversation:\n{history_context}"
+    )
+
+    return call_chat_model(system_prompt, user_prompt)
 
 
 def build_source_context(
@@ -443,18 +570,40 @@ def fix_common_mojibake(text: str) -> str:
     return text
 
 
-def call_chat_model(system_prompt: str, user_prompt: str) -> str:
-    """Call the configured Berget chat-completions model."""
+def get_chat_api_key() -> str:
+    """Read an OpenAI-format API key, with provider-specific aliases supported."""
 
-    api_key = os.getenv("BERGET_API_KEY")
+    return os.getenv("OPENAI_API_KEY") or os.getenv("BERGET_API_KEY", "")
+
+
+def get_chat_base_url() -> str:
+    """Read the OpenAI-compatible chat API base URL."""
+
+    return (
+        os.getenv("OPENAI_BASE_URL")
+        or os.getenv("BERGET_BASE_URL")
+        or DEFAULT_OPENAI_BASE_URL
+    )
+
+
+def get_chat_model() -> str:
+    """Read the OpenAI-compatible chat model name."""
+
+    return os.getenv("OPENAI_MODEL") or os.getenv("BERGET_MODEL") or DEFAULT_OPENAI_MODEL
+
+
+def call_chat_model(system_prompt: str, user_prompt: str) -> str:
+    """Call the configured OpenAI-compatible chat-completions model."""
+
+    api_key = get_chat_api_key()
     if not api_key:
         return (
-            "BERGET_API_KEY is not set, so I cannot call the model yet.\n"
+            "OPENAI_API_KEY is not set, so I cannot call the model yet.\n"
             f"Prompt that would have been sent:\n{user_prompt}"
         )
 
     payload = {
-        "model": os.getenv("BERGET_MODEL", DEFAULT_BERGET_MODEL),
+        "model": get_chat_model(),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -462,7 +611,7 @@ def call_chat_model(system_prompt: str, user_prompt: str) -> str:
         "temperature": 0.2,
     }
 
-    base_url = os.getenv("BERGET_BASE_URL", "https://api.berget.ai/v1").rstrip("/")
+    base_url = get_chat_base_url().rstrip("/")
     request = urllib.request.Request(
         f"{base_url}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -570,6 +719,23 @@ def wants_study_notes(question: str) -> bool:
     )
 
 
+def wants_quiz(question: str) -> bool:
+    """Detect requests for an interactive quiz."""
+
+    normalized = question.lower()
+    return any(phrase in normalized for phrase in QUIZ_REQUEST_PHRASES)
+
+
+def wants_new_action(question: str) -> bool:
+    """Detect commands that should not be consumed as pending quiz answers."""
+
+    normalized = question.lower().strip()
+    if normalized in {"exit", "quit"}:
+        return True
+
+    return wants_quiz(question) or wants_study_notes(question) or wants_web_search(question)
+
+
 def extract_study_notes_topic(
     question: str,
     conversation_history: list[dict[str, str]] | None = None,
@@ -597,6 +763,34 @@ def extract_study_notes_topic(
         r"^create\s+a\s+study\s+guide\s+(about|on|for)\s+",
         r"^prepare\s+a\s+study\s+guide\s+(about|on|for)\s+",
         r"^summarize\s+",
+    )
+    for pattern in cleanup_patterns:
+        topic = re.sub(pattern, "", topic, flags=re.IGNORECASE)
+
+    topic = topic.strip()
+    if has_vague_topic_reference(topic) and conversation_history:
+        return infer_topic_from_history(conversation_history)
+
+    return topic or infer_topic_from_history(conversation_history or []) or question.strip()
+
+
+def extract_quiz_topic(
+    question: str,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> str:
+    """Extract a compact topic from a quiz request."""
+
+    topic = question.strip().rstrip(".?!")
+    cleanup_patterns = (
+        r"^please\s+",
+        r"^can you\s+",
+        r"^could you\s+",
+        r"^quiz\s+me\s+(about|on|for)\s+",
+        r"^test\s+me\s+(about|on|for)\s+",
+        r"^drill\s+me\s+(about|on|for)\s+",
+        r"^give\s+me\s+a\s+quiz\s+(about|on|for)\s+",
+        r"^make\s+me\s+a\s+quiz\s+(about|on|for)\s+",
+        r"^ask\s+me\s+questions\s+(about|on|for)\s+",
     )
     for pattern in cleanup_patterns:
         topic = re.sub(pattern, "", topic, flags=re.IGNORECASE)
