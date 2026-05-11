@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
 
+from tools.create_study_notes import create_study_note
 from tools.search_documents import (
     build_index,
     format_chunks_for_prompt,
@@ -36,6 +38,7 @@ from tools.web_search import format_web_results_for_prompt, search_web
 BASE_DIR = Path(__file__).resolve().parent
 COURSE_DIR = BASE_DIR / "course_material"
 MEMORY_FILE = BASE_DIR / "memory" / "struggles.md"
+NOTES_DIR = BASE_DIR / "generated_notes"
 AGENT_FILE = BASE_DIR / "agent.md"
 SOUL_FILE = BASE_DIR / "soul.md"
 ENV_FILE = BASE_DIR.parent / ".env"
@@ -89,6 +92,38 @@ GENERAL_WEB_FALLBACK_PHRASES = (
     "recent",
 )
 
+STUDY_NOTES_PHRASES = (
+    "create study notes",
+    "make study notes",
+    "generate study notes",
+    "write study notes",
+    "create notes",
+    "make notes",
+    "write notes",
+    "exam notes",
+    "study guide",
+    "practice questions",
+    "summarize",
+)
+
+FOLLOW_UP_CUES = (
+    "yes",
+    "no",
+    "why",
+    "how",
+    "what about",
+    "can you",
+    "could you",
+    "can you explain",
+    "explain more",
+    "tell me more",
+    "give an example",
+    "examples",
+    "that",
+    "this",
+    "it",
+)
+
 
 def main() -> None:
     """Run a tiny interactive tutor session."""
@@ -107,6 +142,7 @@ def main() -> None:
     print("Ask a question, or type 'exit' to stop.\n")
 
     previous_questions: list[str] = []
+    conversation_history: list[dict[str, str]] = []
 
     while True:
         question = input("Student> ").strip()
@@ -116,14 +152,17 @@ def main() -> None:
             continue
 
         retrieval_question = question_for_retrieval(question, previous_questions)
+        retrieval_query = query_for_retrieval(question, retrieval_question, conversation_history)
         explicit_web_request = wants_web_search(question)
         if retrieval_question != question:
             print(f"\nGoal: answer previous question with web search: {retrieval_question}")
+        elif retrieval_query != question:
+            print(f"\nGoal: answer follow-up using recent conversation: {question}")
         else:
             print("\nGoal: answer using local course material.")
 
         print("Retrieve: searching course_material/...")
-        chunks = search_documents(retrieval_question, COURSE_DIR, top_k=3)
+        chunks = search_documents(retrieval_query, COURSE_DIR, top_k=3)
         web_results = []
         web_reason = None
         use_web_fallback, fallback_reason = should_use_web_fallback(
@@ -148,8 +187,30 @@ def main() -> None:
             else:
                 print(f"- No web context retrieved ({web_reason}).")
 
-        print("Answer:")
-        answer = answer_question(retrieval_question, chunks, web_results, web_reason)
+        if wants_study_notes(question):
+            print("Skill: study_notes...")
+            created_study_notes = True
+            answer, note_path = create_study_notes_answer(
+                retrieval_question,
+                chunks,
+                web_results,
+                web_reason,
+                conversation_history,
+            )
+            if note_path:
+                print(f"- Saved {note_path.relative_to(BASE_DIR)}")
+            else:
+                print("- Study notes were not saved.")
+        else:
+            created_study_notes = False
+            print("Answer:")
+            answer = answer_question(
+                retrieval_question,
+                chunks,
+                web_results,
+                web_reason,
+                conversation_history,
+            )
         print(answer)
 
         should_update, reason = should_update_memory(
@@ -158,6 +219,7 @@ def main() -> None:
             chunks,
             web_results,
             web_reason,
+            created_study_notes,
         )
         print("Memory update:")
         if should_update:
@@ -167,6 +229,7 @@ def main() -> None:
             print("- No update needed.")
 
         previous_questions.append(retrieval_question)
+        remember_turn(conversation_history, question, answer)
         print()
 
 
@@ -175,6 +238,7 @@ def answer_question(
     chunks: list,
     web_results: list | None = None,
     web_reason: str | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
 ) -> str:
     """
     Ask Berget's OpenAI-compatible chat API to answer with retrieved context.
@@ -183,31 +247,9 @@ def answer_question(
     demonstrates retrieval and memory behavior.
     """
 
-    course_context = format_chunks_for_prompt(chunks)
-    external_context = format_web_results_for_prompt(web_results or [])
+    context = build_source_context(chunks, web_results, web_reason)
     memory_context = read_memory(MEMORY_FILE)
-
-    if course_context and external_context:
-        context = (
-            "Course context, retrieved first:\n"
-            f"{course_context}\n\n"
-            "External web context from the web_search skill, retrieved because local context looked weak:\n"
-            f"{external_context}"
-        )
-    elif course_context:
-        context = f"Course context:\n{course_context}"
-    elif external_context:
-        context = (
-            "No relevant course context was retrieved.\n\n"
-            "External web context from the web_search skill:\n"
-            f"{external_context}"
-        )
-    else:
-        reason = web_reason or "web search was not attempted"
-        context = (
-            "No relevant course context was retrieved.\n"
-            f"No external web context was retrieved because {reason}."
-        )
+    history_context = format_conversation_history(conversation_history or [])
 
     api_key = os.getenv("BERGET_API_KEY")
     if not api_key:
@@ -229,9 +271,156 @@ def answer_question(
         "Do not ask permission to search the web; if web context is present, the search has already happened.\n"
         "If neither source has enough context, say so honestly.\n\n"
         f"Student memory:\n{memory_context}\n\n"
+        f"Recent conversation:\n{history_context}\n\n"
         f"Retrieved context:\n{context}\n\n"
         f"Student question: {question}"
     )
+
+    answer = call_chat_model(system_prompt, user_prompt)
+    if answer.startswith("Model call failed:"):
+        return (
+            f"{answer}\n"
+            "Retrieved context is shown below so the retrieval step remains inspectable:\n"
+            f"{context}"
+        )
+
+    return answer
+
+
+def create_study_notes_answer(
+    question: str,
+    chunks: list,
+    web_results: list | None = None,
+    web_reason: str | None = None,
+    conversation_history: list[dict[str, str]] | None = None,
+) -> tuple[str, Path | None]:
+    """Generate structured study notes and save them as a Markdown artifact."""
+
+    topic = extract_study_notes_topic(question)
+    source_context = build_source_context(chunks, web_results, web_reason)
+    memory_context = read_memory(MEMORY_FILE)
+    history_context = format_conversation_history(conversation_history or [])
+
+    api_key = os.getenv("BERGET_API_KEY")
+    if not api_key:
+        return (
+            "BERGET_API_KEY is not set, so I cannot create study notes yet.\n"
+            "Retrieved context:\n"
+            f"{source_context}",
+            None,
+        )
+
+    system_prompt = (
+        AGENT_FILE.read_text(encoding="utf-8")
+        + "\n\n"
+        + SOUL_FILE.read_text(encoding="utf-8")
+        + "\n\n"
+        + (BASE_DIR / "skills" / "study_notes.md").read_text(encoding="utf-8")
+    )
+    user_prompt = (
+        f"Create Markdown study notes for this topic: {topic}\n\n"
+        "Use the retrieved course context as the primary source. If external web context is present, "
+        "clearly label it as web context. If context is insufficient, say what is missing.\n"
+        "Return only the Markdown note content. Do not mention that you saved a file, and do not invent a file path.\n"
+        "Use plain ASCII characters for formulas and symbols.\n"
+        "Use this structure: title, source note, key concepts, one Mermaid diagram if useful, "
+        "examples, summary table, practice questions with brief answers, and related topics.\n\n"
+        f"Student memory:\n{memory_context}\n\n"
+        f"Recent conversation:\n{history_context}\n\n"
+        f"Retrieved context:\n{source_context}"
+    )
+
+    note_content = call_chat_model(system_prompt, user_prompt)
+    if note_content.startswith("Model call failed:") or note_content.startswith("BERGET_API_KEY is not set"):
+        return (
+            f"Could not create study notes for '{topic}'.\n"
+            f"{note_content}\n\n"
+            "Retrieved context is shown below so the retrieval step remains inspectable:\n"
+            f"{source_context}",
+            None,
+        )
+
+    note_content = clean_study_note_content(note_content)
+    note_path = create_study_note(NOTES_DIR, topic, note_content)
+    response = (
+        f"Created study notes for '{topic}'.\n"
+        f"Saved to: {note_path.relative_to(BASE_DIR)}\n\n"
+        f"{note_content}"
+    )
+    return response, note_path
+
+
+def build_source_context(
+    chunks: list,
+    web_results: list | None = None,
+    web_reason: str | None = None,
+) -> str:
+    """Build a shared context block for answers and study-note generation."""
+
+    course_context = format_chunks_for_prompt(chunks)
+    external_context = format_web_results_for_prompt(web_results or [])
+
+    if course_context and external_context:
+        return (
+            "Course context, retrieved first:\n"
+            f"{course_context}\n\n"
+            "External web context from the web_search skill, retrieved because local context looked weak:\n"
+            f"{external_context}"
+        )
+    if course_context:
+        return f"Course context:\n{course_context}"
+    if external_context:
+        return (
+            "No relevant course context was retrieved.\n\n"
+            "External web context from the web_search skill:\n"
+            f"{external_context}"
+        )
+
+    reason = web_reason or "web search was not attempted"
+    return (
+        "No relevant course context was retrieved.\n"
+        f"No external web context was retrieved because {reason}."
+    )
+
+
+def clean_study_note_content(content: str) -> str:
+    """Remove assistant preamble so saved notes contain only the note itself."""
+
+    content = fix_common_mojibake(content)
+    lines = content.strip().splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith("#"):
+            return "\n".join(lines[index:]).strip()
+
+    return content.strip()
+
+
+def fix_common_mojibake(text: str) -> str:
+    """Clean common UTF-8/Windows console artifacts from generated notes."""
+
+    replacements = {
+        "â‰ˆ": "approximately",
+        "â€“": "-",
+        "â€”": "-",
+        "â€™": "'",
+        "â€œ": '"',
+        "â€": '"',
+        "â€¢": "-",
+    }
+    for bad, good in replacements.items():
+        text = text.replace(bad, good)
+    return text
+
+
+def call_chat_model(system_prompt: str, user_prompt: str) -> str:
+    """Call the configured Berget chat-completions model."""
+
+    api_key = os.getenv("BERGET_API_KEY")
+    if not api_key:
+        return (
+            "BERGET_API_KEY is not set, so I cannot call the model yet.\n"
+            f"Prompt that would have been sent:\n{user_prompt}"
+        )
 
     payload = {
         "model": os.getenv("BERGET_MODEL", DEFAULT_BERGET_MODEL),
@@ -257,11 +446,7 @@ def answer_question(
         with urllib.request.urlopen(request, timeout=60) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as error:
-        return (
-            f"Model call failed: {error}\n"
-            "Retrieved context is shown below so the retrieval step remains inspectable:\n"
-            f"{context}"
-        )
+        return f"Model call failed: {error}"
 
     return data["choices"][0]["message"]["content"].strip()
 
@@ -300,11 +485,111 @@ def question_for_retrieval(question: str, previous_questions: list[str]) -> str:
     return question
 
 
+def query_for_retrieval(
+    question: str,
+    retrieval_question: str,
+    conversation_history: list[dict[str, str]],
+) -> str:
+    """Expand short follow-ups with the previous turn for better retrieval."""
+
+    if retrieval_question != question:
+        return retrieval_question
+
+    if not conversation_history or not looks_like_follow_up(question):
+        return question
+
+    previous_user = conversation_history[-1]["student"]
+    return f"{previous_user}\nFollow-up: {question}"
+
+
 def wants_web_search(question: str) -> bool:
     """Detect direct requests to use external web search."""
 
     normalized = question.lower()
     return any(phrase in normalized for phrase in WEB_SEARCH_REQUEST_PHRASES)
+
+
+def looks_like_follow_up(question: str) -> bool:
+    """Detect short/context-dependent follow-up turns."""
+
+    normalized = question.lower().strip()
+    word_count = len(normalized.split())
+    if word_count <= 4:
+        return True
+
+    return any(normalized.startswith(cue) for cue in FOLLOW_UP_CUES)
+
+
+def wants_study_notes(question: str) -> bool:
+    """Detect requests to create reusable study-note artifacts."""
+
+    normalized = question.lower()
+    if any(phrase in normalized for phrase in STUDY_NOTES_PHRASES):
+        return True
+
+    return "notes" in normalized and any(
+        verb in normalized
+        for verb in ("create", "make", "generate", "write", "save", "prepare")
+    )
+
+
+def extract_study_notes_topic(question: str) -> str:
+    """Extract a compact topic from a study-notes request."""
+
+    topic = question.strip().rstrip(".?!")
+    cleanup_patterns = (
+        r"^please\s+",
+        r"^can you\s+",
+        r"^could you\s+",
+        r"^create\s+study\s+notes\s+(about|on|for)\s+",
+        r"^make\s+study\s+notes\s+(about|on|for)\s+",
+        r"^generate\s+study\s+notes\s+(about|on|for)\s+",
+        r"^create\s+notes\s+(about|on|for)\s+",
+        r"^make\s+notes\s+(about|on|for)\s+",
+        r"^write\s+notes\s+(about|on|for)\s+",
+        r"^save\s+notes\s+(about|on|for)\s+",
+        r"^prepare\s+notes\s+(about|on|for)\s+",
+        r"^make\s+exam\s+notes\s+(about|on|for)\s+",
+        r"^prepare\s+exam\s+notes\s+(about|on|for)\s+",
+        r"^create\s+a\s+study\s+guide\s+(about|on|for)\s+",
+        r"^prepare\s+a\s+study\s+guide\s+(about|on|for)\s+",
+        r"^summarize\s+",
+    )
+    for pattern in cleanup_patterns:
+        topic = re.sub(pattern, "", topic, flags=re.IGNORECASE)
+
+    return topic.strip() or question.strip()
+
+
+def format_conversation_history(history: list[dict[str, str]], max_turns: int = 4) -> str:
+    """Render recent conversation turns for prompt context."""
+
+    if not history:
+        return "No previous turns in this session."
+
+    parts = []
+    for turn in history[-max_turns:]:
+        parts.append(
+            "Student: "
+            + turn["student"]
+            + "\nTutor: "
+            + shorten_text(turn["tutor"], 500)
+        )
+    return "\n\n".join(parts)
+
+
+def remember_turn(history: list[dict[str, str]], student: str, tutor: str, max_turns: int = 8) -> None:
+    """Keep a compact in-session conversation history."""
+
+    history.append({"student": student, "tutor": tutor})
+    del history[:-max_turns]
+
+
+def shorten_text(text: str, max_chars: int) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 3] + "..."
 
 
 def should_update_memory(
@@ -313,6 +598,7 @@ def should_update_memory(
     chunks: list | None = None,
     web_results: list | None = None,
     web_reason: str | None = None,
+    created_study_notes: bool = False,
 ) -> tuple[bool, str]:
     """
     Decide whether the agent should call the memory tool.
@@ -330,6 +616,9 @@ def should_update_memory(
 
     if any(phrase in normalized for phrase in LEARNING_SIGNAL_PHRASES):
         return True, "student learning preference or struggle signal"
+
+    if created_study_notes:
+        return True, "created study notes"
 
     if web_results:
         return True, "needed external web context"
@@ -369,6 +658,7 @@ def ensure_workspace() -> None:
 
     COURSE_DIR.mkdir(parents=True, exist_ok=True)
     MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    NOTES_DIR.mkdir(parents=True, exist_ok=True)
     if not MEMORY_FILE.exists():
         MEMORY_FILE.write_text("# Student Struggle Areas\n\n", encoding="utf-8")
 

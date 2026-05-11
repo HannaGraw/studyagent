@@ -6,3 +6,5 @@ venv/
 .DS_Store
 agent/course_material/.document_index.json
 agent/course_material/*.pdf
+agent/generated_notes/*.md
+!agent/generated_notes/.gitkeep
